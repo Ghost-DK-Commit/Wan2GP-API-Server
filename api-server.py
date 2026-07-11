@@ -21,6 +21,13 @@ import uvicorn
 _AUTH_USERNAME: str = ""
 _AUTH_PASSWORD: str = ""
 _REQUIRE_AUTH: bool = False
+_ALLOWED_ORIGINS: list[str] = []
+_MAX_REQUEST_BYTES: int = 10 * 1024 * 1024
+
+_failed_attempts: dict[str, list[float]] = {}
+_blocked_ips: dict[str, float] = {}
+_MAX_FAILED_ATTEMPTS = 5
+_LOCKOUT_SECONDS = 300
 
 
 CONFIG_PATH = PROJECT_ROOT / "wgp_config.json"
@@ -412,21 +419,57 @@ class ParseTagsResponse(BaseModel):
 
 app = FastAPI(
     title="WanGP API",
-    description="REST API for WanGP media generation. Reads settings from wgp_config.json.",
+    description="REST API for WanGP media generation.",
     version="1.0.0",
+    docs_url=None if _REQUIRE_AUTH else "/docs",
+    redoc_url=None if _REQUIRE_AUTH else "/redoc",
+    openapi_url=None if _REQUIRE_AUTH else "/openapi.json",
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+def _get_client_ip(request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _is_ip_blocked(ip: str) -> bool:
+    if ip in _blocked_ips:
+        if time.time() - _blocked_ips[ip] < _LOCKOUT_SECONDS:
+            return True
+        del _blocked_ips[ip]
+        _failed_attempts.pop(ip, None)
+    return False
+
+
+def _record_failed_attempt(ip: str) -> bool:
+    now = time.time()
+    if ip not in _failed_attempts:
+        _failed_attempts[ip] = []
+    _failed_attempts[ip] = [t for t in _failed_attempts[ip] if now - t < _LOCKOUT_SECONDS]
+    _failed_attempts[ip].append(now)
+    if len(_failed_attempts[ip]) >= _MAX_FAILED_ATTEMPTS:
+        _blocked_ips[ip] = now
+        return True
+    return False
 
 
 @app.middleware("http")
-async def auth_middleware(request, call_next):
+async def security_middleware(request, call_next):
+    ip = _get_client_ip(request)
+
+    if _is_ip_blocked(ip):
+        remaining = int(_LOCKOUT_SECONDS - (time.time() - _blocked_ips[ip]))
+        return JSONResponse(
+            status_code=429,
+            content={"detail": f"Too many failed attempts. Try again in {remaining}s."},
+        )
+
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > _MAX_REQUEST_BYTES:
+        return JSONResponse(status_code=413, content={"detail": "Request too large"})
+
     if _REQUIRE_AUTH:
         auth_header = request.headers.get("Authorization")
         if not auth_header or not auth_header.startswith("Basic "):
@@ -441,30 +484,52 @@ async def auth_middleware(request, call_next):
             decoded = base64.b64decode(encoded).decode("utf-8")
             username, password = decoded.split(":", 1)
             if not (secrets.compare_digest(username, _AUTH_USERNAME) and secrets.compare_digest(password, _AUTH_PASSWORD)):
+                blocked = _record_failed_attempt(ip)
+                attempts_left = _MAX_FAILED_ATTEMPTS - len(_failed_attempts.get(ip, []))
+                detail = "Invalid username or password"
+                if blocked:
+                    detail = f"IP blocked for {_LOCKOUT_SECONDS}s due to too many failures"
+                elif attempts_left > 0:
+                    detail = f"Invalid username or password ({attempts_left} attempts left)"
                 return JSONResponse(
                     status_code=401,
-                    content={"detail": "Invalid username or password"},
+                    content={"detail": detail},
                     headers={"WWW-Authenticate": "Basic"},
                 )
+            _failed_attempts.pop(ip, None)
         except Exception:
+            _record_failed_attempt(ip)
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Invalid authentication header"},
                 headers={"WWW-Authenticate": "Basic"},
             )
-    return await call_next(request)
+
+    response = await call_next(request)
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    if _REQUIRE_AUTH:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+
+    return response
 
 @app.get("/")
 def root():
+    if _REQUIRE_AUTH:
+        return {"name": "WanGP API", "status": "running", "authentication": "required"}
     return {
         "name": "WanGP API",
         "version": "1.0.0",
         "status": "running",
-        "authentication": "required" if _REQUIRE_AUTH else "disabled",
+        "authentication": "disabled",
         "endpoints": {
             "create_task": "POST /create_task",
-            "create_task_raw": "POST /create_task_raw (raw tags from external sites)",
-            "parse_tags": "POST /parse_tags (parse raw tags without generating)",
+            "create_task_raw": "POST /create_task_raw",
+            "parse_tags": "POST /parse_tags",
             "task_status": "GET /task_status/{task_id}",
             "release_task": "POST /release_task/{task_id}",
             "get_result": "GET /get_result/{task_id}",
@@ -669,6 +734,7 @@ if __name__ == "__main__":
     parser.add_argument("--password", type=str, default="", help="Password for API authentication")
     parser.add_argument("--require-auth", action="store_true", default=False, help="Force authentication even for local connections")
     parser.add_argument("--reset-auth", action="store_true", default=False, help="Reset saved authentication credentials")
+    parser.add_argument("--allowed-origins", type=str, nargs="*", default=[], help="CORS allowed origins (e.g. http://localhost:3000)")
     args = parser.parse_args()
     if args.config:
         alt_config = Path(args.config) / "wgp_config.json"
@@ -718,11 +784,32 @@ if __name__ == "__main__":
         _save_auth(_AUTH_USERNAME, _AUTH_PASSWORD)
         print("Authentication enabled (explicit --username/--password provided)")
 
+    if args.allowed_origins:
+        _ALLOWED_ORIGINS = args.allowed_origins
+    elif not _REQUIRE_AUTH:
+        _ALLOWED_ORIGINS = ["*"]
+
+    if _REQUIRE_AUTH:
+        app.docs_url = None
+        app.redoc_url = None
+        app.openapi_url = None
+
+    _origins = _ALLOWED_ORIGINS if _ALLOWED_ORIGINS else []
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_origins,
+        allow_credentials=bool(_origins),
+        allow_methods=["GET", "POST", "PUT"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
     print(f"WanGP API Server - Config: {CONFIG_PATH}")
     print(f"Starting on http://{args.host}:{args.port}")
     if _REQUIRE_AUTH:
         print("Authentication: REQUIRED (HTTP Basic Auth)")
+        print("API docs: DISABLED (security)")
+        print(f"CORS origins: {_ALLOWED_ORIGINS or 'none'}")
     else:
         print("Authentication: DISABLED (local connection)")
     print(f"Docs: http://{args.host}:{args.port}/docs")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")    
