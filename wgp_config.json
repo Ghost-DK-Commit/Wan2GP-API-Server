@@ -23,7 +23,7 @@
     "image_profile": 4,
     "audio_profile": 3.5,
     "preload_model_policy": [],
-    "UI_theme": "suno",
+    "UI_theme": "default",
     "checkpoints_paths": [
         "ckpts",
         "."
