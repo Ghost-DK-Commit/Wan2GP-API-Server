@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Wan2GP WebUI Launcher/Wan2GP WebUI Launcher.csproj" Id="555a6ede-08e8-460d-a9ee-c280addb9220" />
+  <Project Path="Wan2GP Installer/Wan2GP Installer.csproj" />
+  <Project Path="Wan2GP API Server Launcher/Wan2GP API Server Launcher.csproj" />
+</Solution>
