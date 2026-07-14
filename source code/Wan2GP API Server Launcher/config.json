@@ -1,0 +1,9 @@
+{
+  "ApiHost": "127.0.0.1",
+  "ApiPort": 8001,
+  "CondaEnvironment": "wan2gp",
+  "CondaPath": "",
+  "ApiUsername": "",
+  "ApiPassword": "",
+  "ServerDirectory": ""
+}
